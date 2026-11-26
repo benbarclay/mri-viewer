@@ -1,0 +1,28 @@
+[tasks.build]
+description = "Debug build of all targets"
+run = "swift build"
+
+[tasks.test]
+description = "Unit + end-to-end tests on synthetic phantoms"
+run = "swift test"
+
+[tasks.app]
+description = "Build 'build/MRI Viewer.app' (release, ad-hoc signed)"
+run = "scripts/make-app.sh"
+
+[tasks.run]
+description = "Build and open the app"
+depends = ["app"]
+run = "open 'build/MRI Viewer.app'"
+
+[tasks.demo]
+description = "Write a synthetic phantom to build/phantom and open it in the app"
+run = """
+swift build -c release --product mritool --product MRIViewer
+$(swift build -c release --show-bin-path)/mritool phantom build/phantom --plane sagittal
+$(swift build -c release --show-bin-path)/MRIViewer --open build/phantom
+"""
+
+[tasks.check-data]
+description = "Fail if any DICOM / volume / mesh file is tracked by git"
+run = "scripts/check-no-medical-data.sh"

@@ -1,0 +1,25 @@
+# Build output
+.build/
+build/
+.swiftpm/
+*.xcodeproj/
+DerivedData/
+.DS_Store
+
+# Medical data and generated models must never be committed.
+data/
+scans/
+*.dcm
+*.DCM
+DICOMDIR
+*.nii
+*.nii.gz
+*.mgz
+*.nrrd
+*.stl
+*.STL
+*.obj
+*.3mf
+*.ply
+*.u16
+*.pdf
