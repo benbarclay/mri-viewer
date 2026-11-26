@@ -218,6 +218,19 @@ public enum MeshOps {
         compact(&m)
     }
 
+    /// Drops connected pieces smaller than `fraction` of the largest piece (printing debris).
+    public static func dropSmallComponents(_ m: inout Mesh, fraction: Double) {
+        let (ids, sizes) = components(m)
+        guard sizes.count > 1, let big = sizes.max() else { return }
+        let keep = sizes.map { Double($0) >= Double(big) * fraction }
+        var tris: [UInt32] = []
+        for (t, id) in ids.enumerated() where keep[Int(id)] {
+            tris += [m.triangles[3 * t], m.triangles[3 * t + 1], m.triangles[3 * t + 2]]
+        }
+        m.triangles = tris
+        compact(&m)
+    }
+
     /// Removes unreferenced vertices.
     public static func compact(_ m: inout Mesh) {
         var remap = [UInt32](repeating: .max, count: m.vertices.count)
@@ -240,6 +253,28 @@ public enum MeshOps {
         for i in m.vertices.indices { m.vertices[i] *= s }
     }
 
+    /// Number of triangles a ray from `origin` along `dir` crosses (Möller–Trumbore).
+    public static func rayHits(_ m: Mesh, from origin: SIMD3<Float>, dir: SIMD3<Float>) -> Int {
+        var hits = 0
+        let d = simd_normalize(dir)
+        for t in Swift.stride(from: 0, to: m.triangles.count, by: 3) {
+            let a = m.vertices[Int(m.triangles[t])], b = m.vertices[Int(m.triangles[t + 1])], c = m.vertices[Int(m.triangles[t + 2])]
+            let e1 = b - a, e2 = c - a, h = simd_cross(d, e2), det = simd_dot(e1, h)
+            if abs(det) < 1e-9 { continue }
+            let f = 1 / det, s = origin - a, u = f * simd_dot(s, h)
+            if u < 0 || u > 1 { continue }
+            let q = simd_cross(s, e1), w = f * simd_dot(d, q)
+            if w < 0 || u + w > 1 { continue }
+            if f * simd_dot(e2, q) > 0 { hits += 1 }
+        }
+        return hits
+    }
+
+    /// Point-in-closed-mesh by ray parity (slightly skewed ray to avoid edge/vertex hits).
+    public static func contains(_ m: Mesh, _ p: SIMD3<Float>) -> Bool {
+        rayHits(m, from: p, dir: SIMD3<Float>(1, 0.000123, 0.000457)) % 2 == 1
+    }
+
     public static func bounds(_ m: Mesh) -> (min: SIMD3<Float>, max: SIMD3<Float>)? {
         guard var lo = m.vertices.first else { return nil }
         var hi = lo
@@ -255,6 +290,35 @@ public enum MeshOps {
 }
 
 // MARK: - Validation
+
+public enum MeshMetrics {
+    /// Fraction of surface area whose face normal lies within `degrees` of ±one of `axes`.
+    /// Voxel stair-steps show up as a large value; a smooth organic surface scores ≈ 5 % at 10°
+    /// (the solid-angle share of six 10° caps for uniformly distributed normals).
+    /// `excludeNearBoundsMM` skips faces within that distance of the bounding box (flat cuts made by the
+    /// scan's field of view are genuinely flat and are not stair-steps).
+    public static func axisAlignedFraction(_ m: Mesh, axes: [SIMD3<Float>], degrees: Float = 10, excludeNearBoundsMM: Float = 0) -> Double {
+        let c = cos(degrees * .pi / 180)
+        let bb = MeshOps.bounds(m)
+        let units = axes.map { simd_normalize($0) }
+        var aligned = 0.0, total = 0.0
+        for t in stride(from: 0, to: m.triangles.count, by: 3) {
+            let a = m.vertices[Int(m.triangles[t])], b = m.vertices[Int(m.triangles[t + 1])], cc = m.vertices[Int(m.triangles[t + 2])]
+            let n = simd_cross(b - a, cc - a)
+            let area = Double(simd_length(n)) / 2
+            guard area > 0 else { continue }
+            let u = simd_normalize(n)
+            if excludeNearBoundsMM > 0, let bb {
+                let ctr = (a + b + cc) / 3
+                let near = simd_min(ctr - bb.min, bb.max - ctr)
+                if near.min() < excludeNearBoundsMM { continue }
+            }
+            total += area
+            if units.contains(where: { abs(simd_dot($0, u)) >= c }) { aligned += area }
+        }
+        return total > 0 ? aligned / total : 0
+    }
+}
 
 public struct MeshReport: CustomStringConvertible {
     public let vertices: Int

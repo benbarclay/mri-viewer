@@ -20,6 +20,8 @@ public enum ModelMode: String, CaseIterable, Identifiable {
     }
 }
 
+public enum SurfaceSource: String, CaseIterable { case intensity, mask }
+
 public struct ModelOptions: Equatable {
     public var mode: ModelMode = .brain
     /// Intensity threshold; nil = automatic (see `ModelBuilder.autoThreshold`).
@@ -39,6 +41,9 @@ public struct ModelOptions: Equatable {
     /// Brain mode: cut off the thin inferior tail (spinal cord) where the axial cross-section is below
     /// this fraction of the largest cross-section. Also gives the print a flat base. 0 disables.
     public var trimTailFraction: Double = 0.05
+    /// Where the surface comes from: the intensity edge near the segmentation (smooth, sub-voxel)
+    /// or the binary mask alone (blocky; kept for comparison).
+    public var surface: SurfaceSource = .intensity
     public init() {}
 }
 
@@ -52,6 +57,8 @@ public struct ModelResult {
     public var mask: [UInt8]?
     /// The volume the model was built from (after downsampling).
     public var volume: Volume
+    /// Share of surface area facing the voxel grid axes (stair-step indicator; ≈ 0.05 is smooth).
+    public var stepping: Double
     public var log: [String]
 }
 
@@ -68,12 +75,33 @@ public enum ModelBuilder {
 
     public struct AutoThresholds { public let head: Float, whiteMatter: Float, brain: Float, coreML: Double }
 
-    /// Head: Otsu (air vs tissue). White matter: 75th percentile of intensities deep inside the head
+    /// Head: the valley between the background-air peak and the tissue intensities (Otsu is pulled
+    /// up into the tissue range by the huge air peak and cuts off dark scalp). White matter: 75th percentile of intensities deep inside the head
     /// (≥ 25 mm from the skin, which in an adult head is inside the brain and dominated by white matter).
     /// Brain/CSF boundary: `brainFractionOfWM` × white matter.
+    /// Valley of the (smoothed) histogram just above the background-air peak.
+    public static func airTissueThreshold(_ s: [Float]) -> Float {
+        var sorted = s
+        sorted.sort()
+        let top = sorted[Int(Double(sorted.count - 1) * 0.99)]
+        guard top > 0 else { return Filters.otsu(s) }
+        let bins = 256
+        var h = [Double](repeating: 0, count: bins)
+        let scale = Float(bins - 1) / top
+        for x in s where x >= 0 && x <= top { h[Int(x * scale)] += 1 }
+        var sm = h
+        for i in 2 ..< bins - 2 { sm[i] = (h[i - 2] + 2 * h[i - 1] + 3 * h[i] + 2 * h[i + 1] + h[i + 2]) / 9 }
+        // Background peak in the lowest 20 % of the range, then the minimum before tissue rises again.
+        let bgPeak = (0 ..< bins / 5).max { sm[$0] < sm[$1] } ?? 0
+        var valley = bgPeak
+        for i in bgPeak ..< bins / 2 where sm[i] < sm[valley] { valley = i }
+        guard valley > bgPeak else { return Filters.otsu(s) }
+        return (Float(valley) + 0.5) / scale
+    }
+
     public static func autoThresholds(_ v: Volume, smoothed s: [Float]) -> AutoThresholds {
         let g = Grid(v)
-        let head = Filters.otsu(s)
+        let head = airTissueThreshold(s)
         let headMask = Filters.fillHoles(Filters.largestComponent(Filters.threshold(s, head), g), g)
         var core: [UInt8] = []
         for depth in [25.0, 18.0, 12.0] {
@@ -99,12 +127,21 @@ public enum ModelBuilder {
             // The skin is a thin shell around dark skull/CSF: seal small openings (closing), fill the
             // inside, then keep the largest piece. Without the fill the brain would win as "largest".
             if o.fillCavities {
+                // Seal small openings (nostrils, ear canals) with a light closing.
                 let r = 3.0
-                m = Filters.erode(Filters.fillHoles(Filters.dilate(m, g, radiusMM: r), g), g, radiusMM: r)
-                m = Filters.fillHoles(m, g)
-                // Per axial slice as well: handles a head clipped by the top/bottom of the field of view.
+                m = Filters.erode(Filters.fillHolesClosingCutFaces(Filters.dilate(m, g, radiusMM: r), g), g, radiusMM: r, keepCutFaces: true)
+                m = Filters.fillHolesClosingCutFaces(m, g)
                 m = Filters.fillHoles2D(m, g, axis: AnatomicalFrame(v).voxelAxis[2])
-                log.append("closed \(r) mm + filled: \(ml(m, g)) mL")
+                // Dark skull/CSF between scalp and brain is not "enclosed" when the field of view clips the
+                // head on several faces (it leaks out through the cut corners). Fill it from a large closing,
+                // but only deeper than the scalp, so concave surface detail (ears, nostrils) is untouched.
+                let big = 8.0, depth = 5.0
+                let closed = Filters.erode(Filters.fillHolesClosingCutFaces(Filters.dilate(m, g, radiusMM: big), g), g,
+                                           radiusMM: big, keepCutFaces: true)
+                let interior = Filters.erode(closed, g, radiusMM: depth, keepCutFaces: true)
+                for i in 0 ..< m.count where interior[i] != 0 { m[i] = 1 }
+                m = Filters.fillHolesClosingCutFaces(m, g)
+                log.append("closed + filled (interior from \(Int(big)) mm closing): \(ml(m, g)) mL")
             }
             m = Filters.largestComponent(m, g)
             log.append("largest component: \(ml(m, g)) mL")
@@ -159,9 +196,18 @@ public enum ModelBuilder {
             segLog.forEach(step)
             maskML = Double(Filters.count(m)) * g.voxelVolume / 1000
             finalMask = m
-            // Light blur of the binary mask gives a smooth sub-voxel surface at 0.5.
-            field = Filters.gaussian(m.map { Float($0) }, g, sigmaMM: 0.6 * min(g.sx, g.sy, g.sz))
-            iso = 0.5
+            switch o.surface {
+            case .intensity:
+                // Head: filled openings (nostrils, mouth, ear canals) have no intensity edge, so the mask
+                // field shapes them; blur it more there to avoid slice-wise terraces from the 2-D fill.
+                let blur = o.mode == .head ? 1.5 : 0.75 * min(g.sx, g.sy, g.sz)
+                field = Fields.guided(intensity: smoothed, threshold: t, mask: m, g, contrast: t, maskBlurMM: blur)
+                iso = 0
+            case .mask:
+                // Light blur of the binary mask (voxel terraces remain visible).
+                field = Filters.gaussian(m.map { Float($0) }, g, sigmaMM: 0.6 * min(g.sx, g.sy, g.sz))
+                iso = 0.5
+            }
         }
         step("extracting surface")
         var mesh = Isosurface.extract(field, g, iso: iso, toPatient: { v.patient($0) }, flipWinding: v.handedness < 0)
@@ -174,8 +220,11 @@ public enum ModelBuilder {
         MeshOps.lpsToPrintFrame(&mesh)
         MeshOps.placeOnBuildPlate(&mesh)
         let report = MeshReport.analyze(mesh)
+        let stepping = MeshMetrics.axisAlignedFraction(mesh, axes: printFrameAxes(v), excludeNearBoundsMM: 2)
+        step(String(format: "stepping (area facing grid axes ±10°, excl. flat FOV cuts): %.1f %%", stepping * 100))
         step(String(format: "done in %.1f s", Date().timeIntervalSince(t0)))
-        return ModelResult(mesh: mesh, report: report, threshold: t, maskVolumeML: maskML, mask: finalMask, volume: v, log: log)
+        return ModelResult(mesh: mesh, report: report, threshold: t, maskVolumeML: maskML, mask: finalMask, volume: v,
+                           stepping: stepping, log: log)
     }
 
     /// Removes mask voxels below the lowest 1 mm axial band whose area reaches `fraction` of the
@@ -198,6 +247,11 @@ public enum ModelBuilder {
         let cut = lo + Double(first)
         for i in 0 ..< v.count where m[i] != 0 && Double(heights[i]) < cut { m[i] = 0 }
         return cut
+    }
+
+    /// Voxel axes expressed in the exported (RAS) frame.
+    static func printFrameAxes(_ v: Volume) -> [SIMD3<Float>] {
+        v.axes.map { SIMD3<Float>(Float(-$0.x), Float(-$0.y), Float($0.z)) }
     }
 
     static func pct(_ m: [UInt8]) -> String { String(format: "%.1f%%", 100 * Double(Filters.count(m)) / Double(max(1, m.count))) }

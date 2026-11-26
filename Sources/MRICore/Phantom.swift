@@ -13,6 +13,10 @@ public enum Phantom {
     public static let headAxes = SIMD3<Double>(75, 95, 90)   // LR, AP, SI semi-axes
     public static let markerCenter = SIMD3<Double>(30, -40, 30)
     public static let markerRadius = 6.0
+    /// Eyeballs (dark vitreous) inside balls of bright orbital fat, in front of/below the frontal lobes.
+    public static let eyeCenters = [SIMD3<Double>(32, -76, -40), SIMD3<Double>(-32, -76, -40)]
+    public static let eyeRadius = 11.0
+    public static let orbitRadius = 15.0
 
     static func ellipsoid(_ p: SIMD3<Double>, _ scale: Double) -> Double {
         let q = p / (headAxes * scale)
@@ -31,6 +35,13 @@ public enum Phantom {
     /// Noise-free intensity at a patient-space point.
     public static func intensity(_ p: SIMD3<Double>) -> Float {
         if simd_length(p - markerCenter) <= markerRadius { return 1200 }
+        for c in eyeCenters {
+            let d = simd_length(p - c)
+            if d <= eyeRadius { return 100 }
+            if d <= orbitRadius { return 900 }
+        }
+        // Nose: makes the face reach well in front of the brain, as on a scan that isn't defaced.
+        if simd_length_squared((p - SIMD3<Double>(0, -95, -50)) / SIMD3<Double>(9, 14, 20)) <= 1 { return 500 }
         let inHead = ellipsoid(p, 1.0) <= 1
         let inNeck = p.z < -40 && (p.x * p.x / (45 * 45) + p.y * p.y / (50 * 50)) <= 1
         if !inHead && !inNeck { return 0 }
@@ -44,6 +55,24 @@ public enum Phantom {
         }
         if ellipsoid(p, 0.68) <= 1 { return 800 }         // white matter
         return 520                                        // grey matter
+    }
+
+    /// FreeSurfer-style label (aparc.DKTatlas+aseg numbering) for a point, mimicking FastSurfer output:
+    /// cortical lobe parcels on the brain rim, cerebral white matter inside, ventricles, cerebellum, brainstem.
+    public static func label(_ p: SIMD3<Double>) -> Int32 {
+        guard isBrain(p), simd_length(p - markerCenter) > markerRadius || true else { return 0 }
+        let left = p.x > 0 // LPS: +x = patient left
+        if p.z < -25 && p.y > 35 { return left ? 8 : 47 }            // cerebellum cortex
+        if abs(p.x) < 12 && p.z < -20 && p.y > -10 && p.y < 35 { return 16 } // brainstem
+        for c in [SIMD3<Double>(-12, 0, 10), SIMD3<Double>(12, 0, 10)] {
+            if simd_length_squared((p - c) / SIMD3<Double>(6, 22, 9)) <= 1 { return c.x > 0 ? 4 : 43 }
+        }
+        if ellipsoid(p, 0.68) <= 1 { return left ? 2 : 41 }          // white matter
+        let base: Int32 = left ? 1000 : 2000
+        if p.y < -25 { return base + 28 }                             // superior frontal
+        if p.y > 45 { return base + 11 }                              // lateral occipital
+        if p.z < 0 && abs(p.x) > 30 { return base + 30 }              // superior temporal
+        return base + 29                                              // superior parietal
     }
 
     struct Geometry {
@@ -70,7 +99,10 @@ public enum Phantom {
 
     /// Writes one DICOM file per slice into `dir` (created if needed). Returns the slice count.
     @discardableResult
-    public static func write(to dir: URL, plane: Plane, encoding: Encoding = .explicitLE, noise: Float = 15) throws -> Int {
+    /// `partialVolume` averages 3×3×3 sub-samples per voxel, so tissue edges blend like a real scan
+    /// (needed to test sub-voxel surface placement); off by default so voxels equal `intensity(_:)` exactly.
+    public static func write(to dir: URL, plane: Plane, encoding: Encoding = .explicitLE, noise: Float = 15,
+                             partialVolume: Bool = false) throws -> Int {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let g = geometry(plane)
         let center = SIMD3<Double>(0, 0, -10)
@@ -82,7 +114,16 @@ public enum Phantom {
             var px = [UInt16](repeating: 0, count: g.rows * g.cols)
             for r in 0 ..< g.rows { for c in 0 ..< g.cols {
                 let p = ipp + g.row * (Double(c) * g.pixel) + g.col * (Double(r) * g.pixel)
-                var v = intensity(p)
+                var v: Float
+                if partialVolume {
+                    var acc: Float = 0
+                    for a in [-1.0, 0, 1] { for b in [-1.0, 0, 1] { for cc in [-1.0, 0, 1] {
+                        acc += intensity(p + (g.row * a + g.col * b + g.normal * cc) * (g.pixel / 3))
+                    } } }
+                    v = acc / 27
+                } else {
+                    v = intensity(p)
+                }
                 if v > 0 { v += noise * Float(rng.nextGaussian()) }
                 px[r * g.cols + c] = UInt16(clamping: Int(max(0, v).rounded()))
             } }

@@ -45,9 +45,13 @@ enum LaunchOptions {
             store.open(folder: URL(fileURLWithPath: dir))
         }
         if args.contains("--probe") { UIProbe.start(store) }
+        if let labels = value("--labels") { KitProbe.start(store, labels: labels, stay: args.contains("--stay")) }
     }
 }
 
+if CommandLine.arguments.contains("--render-kit") {
+    exit(Probes.renderKit(CommandLine.arguments))
+}
 if CommandLine.arguments.contains("--render-check") {
     exit(Probes.renderCheck(CommandLine.arguments))
 }

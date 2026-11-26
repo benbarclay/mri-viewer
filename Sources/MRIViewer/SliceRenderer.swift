@@ -3,7 +3,7 @@ import MRICore
 
 enum SliceRenderer {
     /// Window/level a slice into an RGBA image, optionally tinting `overlay` voxels.
-    static func image(_ s: Slice2D, center: Float, width: Float, overlay: [UInt8]? = nil) -> CGImage? {
+    static func image(_ s: Slice2D, center: Float, width: Float, overlay: [UInt8]? = nil, colors: [SIMD3<Float>?]? = nil) -> CGImage? {
         let n = s.width * s.height
         var rgba = [UInt8](repeating: 255, count: n * 4)
         let lo = center - width / 2
@@ -16,6 +16,12 @@ enum SliceRenderer {
                 r = UInt8(min(255, Int(Double(g) * 0.6 + 255 * 0.4)))
                 gg = UInt8(min(255, Int(Double(g) * 0.6 + 140 * 0.4)))
                 b = UInt8(Double(g) * 0.6)
+            }
+            if let cs = colors, let c = cs[i] {
+                // 45% tint with the region colour
+                r = UInt8(min(255, Double(g) * 0.55 + Double(c.x) * 255 * 0.45))
+                gg = UInt8(min(255, Double(g) * 0.55 + Double(c.y) * 255 * 0.45))
+                b = UInt8(min(255, Double(g) * 0.55 + Double(c.z) * 255 * 0.45))
             }
             rgba[4 * i] = r; rgba[4 * i + 1] = gg; rgba[4 * i + 2] = b
         }

@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import ImageIO
 import MRICore
+import SceneKit
 import UniformTypeIdentifiers
 
 /// Headless and in-app verification probes. They print numbers, never patient data.
@@ -43,6 +44,34 @@ enum Probes {
             print("error: \(error)")
             return 1
         }
+    }
+}
+
+extension Probes {
+    /// `MRIViewer --render-kit <phantom-dir> <labels> <out.png> [--explode 0.6]` — offscreen render of the
+    /// kit preview scene (phantom only), to check the 3D preview without a window.
+    static func renderKit(_ args: [String]) -> Int32 {
+        guard let i = args.firstIndex(of: "--render-kit"), i + 3 < args.count else { print("usage: --render-kit <dir> <labels> <out.png>"); return 2 }
+        do {
+            let s = try SeriesScanner.scan(directory: URL(fileURLWithPath: args[i + 1]))[0]
+            guard s.description.hasPrefix("PHANTOM") || args.contains("--allow-non-phantom") else {
+                print("refusing: not a synthetic phantom series"); return 3
+            }
+            let v = try VolumeLoader.load(s)
+            let labels = try LabelVolume.read(URL(fileURLWithPath: args[i + 2])).resampled(onto: v)
+            let kit = PrintKit.build(v, labels: labels, options: KitOptions())
+            let explode = args.firstIndex(of: "--explode").flatMap { Double(args[$0 + 1]) } ?? 0.6
+            let scene = KitScene.build(kit)
+            KitScene.apply(scene, explode: explode, showHead: true)
+            let r = SCNRenderer(device: MTLCreateSystemDefaultDevice(), options: nil)
+            r.scene = scene.scene
+            r.pointOfView = scene.scene.rootNode.childNodes.first { $0.camera != nil }
+            let img = r.snapshot(atTime: 0, with: CGSize(width: 1200, height: 900), antialiasingMode: .multisampling4X)
+            guard let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff), let png = rep.representation(using: .png, properties: [:]) else { return 1 }
+            try png.write(to: URL(fileURLWithPath: args[i + 3]))
+            print("rendered \(kit.parts.count) parts → \(args[i + 3])")
+            return 0
+        } catch { print("error: \(error)"); return 1 }
     }
 }
 
@@ -91,6 +120,50 @@ enum UIProbe {
             let overlayOK = store.overlay == .model && m.mask != nil
             print("probe: model overlay active: \(overlayOK)")
             finish(m.report.isWatertight ? 0 : 1, "probe: done in \(String(format: "%.1f", Date().timeIntervalSince(started))) s")
+        default:
+            break
+        }
+    }
+}
+
+/// `--open <dir> --labels <file> --kit-probe [--stay]`: loads a label map, builds the print kit through
+/// the real store, prints the part summary and exits (or stays open with `--stay`, for screenshots).
+@MainActor
+enum KitProbe {
+    static var timer: Timer?
+    static var phase = 0
+    static var started = Date()
+
+    static func start(_ store: ViewerStore, labels: String, stay: Bool) {
+        started = Date()
+        store.panelMode = .kit
+        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
+            MainActor.assumeIsolated { tick(store, labels: labels, stay: stay) }
+        }
+    }
+
+    static func tick(_ store: ViewerStore, labels: String, stay: Bool) {
+        if Date().timeIntervalSince(started) > 300 { print("WARN kit probe timed out in phase \(phase)"); exit(1) }
+        if let e = store.errorText { print("WARN error: \(e)"); exit(1) }
+        switch phase {
+        case 0:
+            guard store.volume != nil else { return }
+            store.loadLabels(URL(fileURLWithPath: labels), source: "probe")
+            phase = 1
+        case 1:
+            guard store.labels != nil, store.regionMap != nil else { return }
+            let regions = Set(store.regionMap!.filter { $0 != 0 })
+            print("kit probe: labels loaded, \(regions.count) regions on the overlay")
+            store.buildKit()
+            phase = 2
+        case 2:
+            guard let k = store.kit, !store.isBuildingKit else { return }
+            for p in k.parts {
+                print(String(format: "kit probe: %@ %.0f mL watertight %@", p.name, p.report.volumeMM3 / 1000, p.report.isWatertight ? "yes" : "NO"))
+            }
+            timer?.invalidate()
+            if stay { store.explode = 0.6; phase = 3; return }
+            exit(k.parts.allSatisfy { $0.report.isWatertight } ? 0 : 1)
         default:
             break
         }
