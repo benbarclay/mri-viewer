@@ -218,6 +218,19 @@ public enum MeshOps {
         compact(&m)
     }
 
+    /// Drops connected pieces smaller than `fraction` of the largest piece (printing debris).
+    public static func dropSmallComponents(_ m: inout Mesh, fraction: Double) {
+        let (ids, sizes) = components(m)
+        guard sizes.count > 1, let big = sizes.max() else { return }
+        let keep = sizes.map { Double($0) >= Double(big) * fraction }
+        var tris: [UInt32] = []
+        for (t, id) in ids.enumerated() where keep[Int(id)] {
+            tris += [m.triangles[3 * t], m.triangles[3 * t + 1], m.triangles[3 * t + 2]]
+        }
+        m.triangles = tris
+        compact(&m)
+    }
+
     /// Removes unreferenced vertices.
     public static func compact(_ m: inout Mesh) {
         var remap = [UInt32](repeating: .max, count: m.vertices.count)
@@ -255,6 +268,35 @@ public enum MeshOps {
 }
 
 // MARK: - Validation
+
+public enum MeshMetrics {
+    /// Fraction of surface area whose face normal lies within `degrees` of ±one of `axes`.
+    /// Voxel stair-steps show up as a large value; a smooth organic surface scores ≈ 5 % at 10°
+    /// (the solid-angle share of six 10° caps for uniformly distributed normals).
+    /// `excludeNearBoundsMM` skips faces within that distance of the bounding box (flat cuts made by the
+    /// scan's field of view are genuinely flat and are not stair-steps).
+    public static func axisAlignedFraction(_ m: Mesh, axes: [SIMD3<Float>], degrees: Float = 10, excludeNearBoundsMM: Float = 0) -> Double {
+        let c = cos(degrees * .pi / 180)
+        let bb = MeshOps.bounds(m)
+        let units = axes.map { simd_normalize($0) }
+        var aligned = 0.0, total = 0.0
+        for t in stride(from: 0, to: m.triangles.count, by: 3) {
+            let a = m.vertices[Int(m.triangles[t])], b = m.vertices[Int(m.triangles[t + 1])], cc = m.vertices[Int(m.triangles[t + 2])]
+            let n = simd_cross(b - a, cc - a)
+            let area = Double(simd_length(n)) / 2
+            guard area > 0 else { continue }
+            let u = simd_normalize(n)
+            if excludeNearBoundsMM > 0, let bb {
+                let ctr = (a + b + cc) / 3
+                let near = simd_min(ctr - bb.min, bb.max - ctr)
+                if near.min() < excludeNearBoundsMM { continue }
+            }
+            total += area
+            if units.contains(where: { abs(simd_dot($0, u)) >= c }) { aligned += area }
+        }
+        return total > 0 ? aligned / total : 0
+    }
+}
 
 public struct MeshReport: CustomStringConvertible {
     public let vertices: Int

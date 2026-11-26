@@ -177,10 +177,11 @@ public enum Filters {
         }
     }
 
-    /// Euclidean erosion by `radiusMM` (outside the grid counts as background).
-    public static func erode(_ mask: [UInt8], _ g: Grid, radiusMM: Double) -> [UInt8] {
+    /// Euclidean erosion by `radiusMM`. Outside the grid counts as background unless
+    /// `keepCutFaces` (then an object clipped by the field of view keeps its cut faces).
+    public static func erode(_ mask: [UInt8], _ g: Grid, radiusMM: Double, keepCutFaces: Bool = false) -> [UInt8] {
         guard radiusMM > 0 else { return mask }
-        let d = distanceSquared(mask, g, to: 0, outsideIsTarget: true)
+        let d = distanceSquared(mask, g, to: 0, outsideIsTarget: !keepCutFaces)
         let r2 = Float(radiusMM * radiusMM)
         return d.map { $0 > r2 ? 1 : 0 }
     }
@@ -288,6 +289,41 @@ public enum Filters {
             }
         }
         return out
+    }
+
+    /// 3-D hole fill for an object clipped by the field of view: the cross-section on each of the six
+    /// grid faces is hole-filled in 2-D first, so interior regions that touch a cut face (e.g. skull and
+    /// CSF where the scan clips the side or top of the head) are not mistaken for outside air.
+    public static func fillHolesClosingCutFaces(_ mask: [UInt8], _ g: Grid) -> [UInt8] {
+        var m = mask
+        let dims = [g.nx, g.ny, g.nz]
+        for axis in 0 ..< 3 {
+            let (ua, va) = axis == 0 ? (1, 2) : axis == 1 ? (0, 2) : (0, 1)
+            let w = dims[ua], h = dims[va]
+            for k in [0, dims[axis] - 1] {
+                func idx(_ u: Int, _ v: Int) -> Int {
+                    var c = [0, 0, 0]; c[axis] = k; c[ua] = u; c[va] = v
+                    return g.index(c[0], c[1], c[2])
+                }
+                var outside = [UInt8](repeating: 0, count: w * h)
+                var stack: [Int] = []
+                func seed(_ u: Int, _ v: Int) {
+                    let j = v * w + u
+                    if outside[j] == 0 && m[idx(u, v)] == 0 { outside[j] = 1; stack.append(j) }
+                }
+                for u in 0 ..< w { seed(u, 0); seed(u, h - 1) }
+                for v in 0 ..< h { seed(0, v); seed(w - 1, v) }
+                while let j = stack.popLast() {
+                    let u = j % w, v = j / w
+                    if u > 0 { seed(u - 1, v) }
+                    if u < w - 1 { seed(u + 1, v) }
+                    if v > 0 { seed(u, v - 1) }
+                    if v < h - 1 { seed(u, v + 1) }
+                }
+                for v in 0 ..< h { for u in 0 ..< w where outside[v * w + u] == 0 { m[idx(u, v)] = 1 } }
+            }
+        }
+        return fillHoles(m, g)
     }
 
     public static func and(_ a: [UInt8], _ b: [UInt8]) -> [UInt8] { zip(a, b).map { $0 & $1 } }

@@ -23,3 +23,4 @@ DICOMDIR
 *.ply
 *.u16
 *.pdf
+.build-*/

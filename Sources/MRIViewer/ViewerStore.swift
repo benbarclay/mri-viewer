@@ -4,13 +4,14 @@ import MRICore
 import SwiftUI
 
 enum OverlayMode: String, CaseIterable, Identifiable {
-    case none, threshold, model
+    case none, threshold, model, regions
     var id: String { rawValue }
     var label: String {
         switch self {
         case .none: return "None"
         case .threshold: return "Threshold"
         case .model: return "Model mask"
+        case .regions: return "Regions"
         }
     }
 }
@@ -41,6 +42,22 @@ final class ViewerStore: ObservableObject {
     @Published var modelLog: [String] = []
     @Published var isBuilding = false
     @Published var showInspector = true
+    // Print kit
+    enum PanelMode: String, CaseIterable { case single = "Single model", kit = "Print kit" }
+    @Published var panelMode: PanelMode = .single
+    @Published var kitOptions = KitOptions()
+    @Published var labels: [Int32]?
+    @Published var regionMap: [Int8]?
+    @Published var labelsSource: String?
+    @Published var kit: KitResult?
+    @Published var kitVersion = 0
+    @Published var kitLog: [String] = []
+    @Published var isBuildingKit = false
+    @Published var segmentationRunning = false
+    @Published var segmentationStarted: Date?
+    @Published var explode: Double = 0
+    @Published var showHeadInPreview = true
+
     /// Bumped whenever slice images must be re-rendered.
     @Published private(set) var renderToken = 0
 
@@ -104,6 +121,11 @@ final class ViewerStore: ObservableObject {
         selectedSeriesID = id
         model = nil
         modelLog = []
+        labels = nil
+        regionMap = nil
+        labelsSource = nil
+        kit = nil
+        kitLog = []
         isBusy = true
         status = "Loading \(s.slices.count) slices…"
         Task.detached(priority: .userInitiated) {
@@ -128,6 +150,7 @@ final class ViewerStore: ObservableObject {
                     self.progress = nil
                     self.status = v.warnings.joined(separator: "; ")
                     self.renderToken += 1
+                    self.loadCachedLabels()
                 }
             } catch {
                 await MainActor.run { self.errorText = "Could not load series: \(error)"; self.isBusy = false; self.progress = nil }
@@ -183,7 +206,7 @@ final class ViewerStore: ObservableObject {
         let sl = r.slice(plane, index: p.slice)
         var overlayMask: [UInt8]?
         switch overlay {
-        case .none:
+        case .none, .regions:
             break
         case .threshold:
             if showInspector {
@@ -195,7 +218,13 @@ final class ViewerStore: ObservableObject {
                 overlayMask = r.maskSlice(plane, index: p.slice, mask: mask)
             }
         }
-        guard let img = SliceRenderer.image(sl, center: windowCenter, width: windowWidth, overlay: overlayMask) else { return nil }
+        var colors: [SIMD3<Float>?]?
+        if overlay == .regions, let rm = regionMap, rm.count == r.volume.count {
+            let specs = Dictionary(uniqueKeysWithValues: Anatomy.parts(deep: true).map { ($0.id, $0.color) })
+            let ids = r.maskSlice(plane, index: p.slice, mask: rm.map { UInt8(bitPattern: $0) })
+            colors = ids.map { $0 == 0 ? nil : specs[Int($0)] }
+        }
+        guard let img = SliceRenderer.image(sl, center: windowCenter, width: windowWidth, overlay: overlayMask, colors: colors) else { return nil }
         return (img, sl)
     }
 

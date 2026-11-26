@@ -123,7 +123,29 @@ struct ModelPreview: View {
     var body: some View {
         ZStack {
             Color.black
-            if let m = store.model {
+            if store.panelMode == .kit, let k = store.kit {
+                KitView(kit: k, token: store.kitVersion, explode: store.explode, showHead: store.showHeadInPreview)
+                    .overlay(alignment: .bottom) {
+                        HStack {
+                            Text("Explode").font(.caption)
+                            Slider(value: $store.explode, in: 0 ... 1).frame(maxWidth: 160)
+                            Toggle("Head", isOn: $store.showHeadInPreview).toggleStyle(.checkbox).font(.caption)
+                        }
+                        .padding(6)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 6))
+                        .padding(8)
+                    }
+            } else if store.panelMode == .kit && store.isBuildingKit {
+                VStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(store.kitLog.last ?? "Building kit…").font(.caption).foregroundStyle(.secondary)
+                }
+            } else if store.panelMode == .kit {
+                VStack(spacing: 8) {
+                    Image(systemName: "square.stack.3d.up").font(.largeTitle).foregroundStyle(.secondary)
+                    Text(store.labels == nil ? "Segment the brain to build a print kit" : "Print kit preview").foregroundStyle(.secondary)
+                }
+            } else if let m = store.model {
                 MeshView(mesh: m.mesh, token: store.modelVersion)
             } else if store.isBuilding {
                 VStack(spacing: 8) {
@@ -145,6 +167,19 @@ struct ModelInspector: View {
     @ObservedObject var store: ViewerStore
 
     var body: some View {
+        VStack(spacing: 0) {
+            Picker("", selection: $store.panelMode) {
+                ForEach(ViewerStore.PanelMode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            if store.panelMode == .kit { KitInspector(store: store) } else { singleModel }
+        }
+    }
+
+    var singleModel: some View {
         Form {
             Section("Model") {
                 Picker("Part", selection: Binding(get: { store.options.mode }, set: { store.options.mode = $0; store.modeChanged() })) {
@@ -209,6 +244,89 @@ struct ModelInspector: View {
             if !store.modelLog.isEmpty {
                 Section("Log") {
                     ForEach(Array(store.modelLog.enumerated()), id: \.offset) { _, line in
+                        Text(line).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+struct KitInspector: View {
+    @ObservedObject var store: ViewerStore
+
+    var body: some View {
+        Form {
+            Section("Brain regions") {
+                if let src = store.labelsSource {
+                    LabeledContent("Segmentation", value: src)
+                } else {
+                    Text("Brain parts come from an anatomical segmentation (FastSurfer, runs locally).")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if store.segmentationRunning {
+                    HStack {
+                        ProgressView().controlSize(.small)
+                        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                            Text("FastSurfer running… \(Int(ctx.date.timeIntervalSince(store.segmentationStarted ?? ctx.date))) s")
+                                .font(.caption)
+                        }
+                    }
+                } else {
+                    HStack {
+                        Button(store.labels == nil ? "Run FastSurfer" : "Re-run") { store.runFastSurfer() }
+                            .disabled(ViewerStore.fastSurferHome() == nil || store.volume == nil)
+                            .help(ViewerStore.fastSurferHome() == nil ? "FastSurfer for macOS is not installed (see README)" : "Segment this series (a few minutes)")
+                        Button("Load Labels…") { store.loadLabelsPanel() }
+                            .disabled(store.volume == nil)
+                    }
+                }
+                Toggle("Deep structures as pieces", isOn: Binding(get: { store.kitOptions.deepStructures },
+                                                                  set: { store.kitOptions.deepStructures = $0; store.refreshRegions() }))
+                    .help("Basal ganglia + thalamus, hippocampus + amygdala and the ventricles as separate inner pieces")
+            }
+            Section("Head") {
+                Toggle("Head shell", isOn: $store.kitOptions.head)
+                Toggle("Eyeballs", isOn: $store.kitOptions.eyes).disabled(!store.kitOptions.head)
+                Stepper(value: $store.kitOptions.cavityClearanceMM, in: 0.2 ... 3, step: 0.1) {
+                    LabeledContent("Brain clearance", value: String(format: "%.1f mm", store.kitOptions.cavityClearanceMM))
+                }
+                Stepper(value: $store.kitOptions.partGapMM, in: 0 ... 1, step: 0.05) {
+                    LabeledContent("Part gap", value: String(format: "%.2f mm", store.kitOptions.partGapMM))
+                }
+                Toggle("Automatic split height", isOn: Binding(get: { store.kitOptions.headSplitMM == nil },
+                                                               set: { store.kitOptions.headSplitMM = $0 ? nil : (store.kit?.splitHeightMM ?? 0) }))
+                if let z = store.kitOptions.headSplitMM {
+                    Slider(value: Binding(get: { z }, set: { store.kitOptions.headSplitMM = $0 }), in: -60 ... 80) {
+                        Text(String(format: "S %.0f mm", z)).monospacedDigit()
+                    }
+                }
+            }
+            Section {
+                Button(store.isBuildingKit ? "Building…" : "Generate Kit") { store.buildKit() }
+                    .disabled(store.labels == nil || store.isBuildingKit)
+                Button("Export Kit…") { store.exportKit() }
+                    .disabled(store.kit == nil)
+            }
+            if let k = store.kit {
+                Section("Parts (\(k.parts.count))") {
+                    ForEach(Array(k.parts.enumerated()), id: \.offset) { _, p in
+                        HStack {
+                            Circle().fill(Color(red: Double(p.color.x), green: Double(p.color.y), blue: Double(p.color.z))).frame(width: 9, height: 9)
+                            Text(p.name)
+                            Spacer()
+                            Text(String(format: "%.0f mL", p.report.volumeMM3 / 1000)).foregroundStyle(.secondary).monospacedDigit()
+                            Image(systemName: p.report.isWatertight ? "checkmark.seal" : "exclamationmark.triangle")
+                                .foregroundStyle(p.report.isWatertight ? Color.secondary : Color.orange)
+                        }
+                        .font(.caption)
+                    }
+                }
+            }
+            if !store.kitLog.isEmpty {
+                Section("Log") {
+                    ForEach(Array(store.kitLog.enumerated()), id: \.offset) { _, line in
                         Text(line).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
                     }
                 }

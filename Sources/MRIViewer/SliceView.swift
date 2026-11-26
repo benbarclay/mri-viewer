@@ -58,23 +58,18 @@ final class SliceNSView: NSView {
         ctx.move(to: CGPoint(x: cx, y: rect.minY)); ctx.addLine(to: CGPoint(x: cx, y: rect.maxY))
         ctx.strokePath()
 
-        // Orientation letters + slice index
+        // Orientation letters + slice index (text rendered once per string and cached).
         let labels = plane.edgeLabels
-        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .semibold),
-                                                    .foregroundColor: NSColor.systemYellow.withAlphaComponent(0.9)]
         func put(_ t: String, _ pt: CGPoint) {
-            let a = NSAttributedString(string: t, attributes: attrs)
-            let sz = a.size()
-            a.draw(at: CGPoint(x: pt.x - sz.width / 2, y: pt.y - sz.height / 2))
+            let img = TextCache.image(t, style: .letter)
+            img.draw(at: CGPoint(x: pt.x - img.size.width / 2, y: pt.y - img.size.height / 2), from: .zero, operation: .sourceOver, fraction: 1)
         }
         put(labels.left, CGPoint(x: rect.minX + 10, y: rect.midY))
         put(labels.right, CGPoint(x: rect.maxX - 10, y: rect.midY))
         put(labels.top, CGPoint(x: rect.midX, y: rect.minY + 10))
         put(labels.bottom, CGPoint(x: rect.midX, y: rect.maxY - 10))
-        let info = NSAttributedString(string: "\(plane.label)  \(p.slice + 1)/\(r.sliceCount(plane))",
-                                      attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium),
-                                                   .foregroundColor: NSColor.white.withAlphaComponent(0.8)])
-        info.draw(at: CGPoint(x: 8, y: 6))
+        TextCache.image("\(plane.label)  \(p.slice + 1)/\(r.sliceCount(plane))", style: .info)
+            .draw(at: CGPoint(x: 8, y: 6), from: .zero, operation: .sourceOver, fraction: 1)
     }
 
     private func moveCursor(to event: NSEvent) {
@@ -142,5 +137,35 @@ struct SliceView: NSViewRepresentable {
         v.plane = plane
         v.store = store
         v.refresh()
+    }
+}
+
+/// Pre-rendered text images: the slice views redraw on every scroll/drag, so text layout is done once
+/// per distinct string instead of creating fonts and attributed strings in every draw.
+@MainActor
+enum TextCache {
+    enum Style { case letter, info }
+    private static var cache: [String: NSImage] = [:]
+    private static let letterAttrs: [NSAttributedString.Key: Any] = [
+        .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .semibold),
+        .foregroundColor: NSColor.systemYellow.withAlphaComponent(0.9),
+    ]
+    private static let infoAttrs: [NSAttributedString.Key: Any] = [
+        .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+        .foregroundColor: NSColor.white.withAlphaComponent(0.8),
+    ]
+
+    static func image(_ text: String, style: Style) -> NSImage {
+        let key = "\(style)|\(text)"
+        if let img = cache[key] { return img }
+        let a = NSAttributedString(string: text, attributes: style == .letter ? letterAttrs : infoAttrs)
+        let size = a.size()
+        let img = NSImage(size: NSSize(width: ceil(size.width), height: ceil(size.height)), flipped: false) { _ in
+            a.draw(at: .zero)
+            return true
+        }
+        if cache.count > 2000 { cache.removeAll() }
+        cache[key] = img
+        return img
     }
 }
