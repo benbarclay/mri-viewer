@@ -4,125 +4,240 @@ import simd
 public struct EyeballEstimate: CustomStringConvertible {
     public let center: SIMD3<Double>   // patient LPS mm
     public let radius: Double          // mm
-    public let score: Double           // shell-minus-core contrast in threshold units
+    public let score: Double           // surround-minus-core contrast in threshold units
+    public let fitRMS: Double          // sphere-fit residual (mm)
 
     public var description: String {
-        String(format: "%@ eye: radius %.1f mm, score %.2f", center.x > 0 ? "left" : "right", radius, score)
+        String(format: "%@ eye: centre LPS (%.0f, %.0f, %.0f), radius %.1f mm, contrast %.2f, sphere-fit rms %.2f mm",
+               center.x > 0 ? "left" : "right", center.x, center.y, center.z, radius, score, fitRMS)
     }
 }
 
-/// Finds the two eyeballs on a T1 image: dark round vitreous (≈ 22–26 mm across) surrounded by bright
-/// orbital fat, in front of and below the frontal lobes. Template matching on a coarse grid, then a
-/// local region-grow to measure each globe.
+/// Finds the eyeballs on a T1 image: dark round vitreous (≈ 22–26 mm across) cupped by brighter orbital
+/// fat and bone behind and around it, below the frontal lobes.
+///
+/// Lessons from real data baked in here:
+/// - The head mask is not used: vitreous is dark and the eyelids are thin, so a skin mask stops at the
+///   retrobulbar fat and leaves the globes "outside".
+/// - Contrast and the sphere fit only look backwards and sideways, never through the front of the eye
+///   (that's air/eyelid, which would dilute the contrast and pull the fit forwards).
+/// - Don't assume adult anatomy: in children the globes are smaller, the centres can be < 50 mm apart and
+///   sit behind the frontal pole, and the face barely protrudes in front of the brain.
 public enum EyeFinder {
+    nonisolated(unsafe) static var fitFailure = ""
+    static let anterior = SIMD3<Double>(0, -1, 0) // LPS
+
     public static func find(_ v: Volume, smoothed s: [Float], head: [UInt8], brain: [UInt8],
                             darkThreshold t: Float, verbose: Bool = false, log: inout [String]) -> [EyeballEstimate] {
         let g = Grid(v)
-        // Brain extent in patient coordinates (anterior = −y in LPS).
-        var yFront = Double.greatestFiniteMagnitude, zLo = Double.greatestFiniteMagnitude, zHi = -Double.greatestFiniteMagnitude
+        var yFront = Double.greatestFiniteMagnitude, zLo = Double.greatestFiniteMagnitude
         var xMid = 0.0, n = 0.0
         for z in Swift.stride(from: 0, to: v.nz, by: 2) { for y in Swift.stride(from: 0, to: v.ny, by: 2) { for x in Swift.stride(from: 0, to: v.nx, by: 2)
             where brain[g.index(x, y, z)] != 0 {
             let p = v.patient(SIMD3(Double(x), Double(y), Double(z)))
-            yFront = min(yFront, p.y); zLo = min(zLo, p.z); zHi = max(zHi, p.z); xMid += p.x; n += 1
+            yFront = min(yFront, p.y); zLo = min(zLo, p.z); xMid += p.x; n += 1
         } } }
         guard n > 0 else { log.append("eyes: no brain mask"); return [] }
         xMid /= n
-        // Is there a face at all? Eyes sit in front of the brain; scans are often defaced for anonymity.
-        var faceDepth = 0.0
-        for z in Swift.stride(from: 0, to: v.nz, by: 2) { for y in Swift.stride(from: 0, to: v.ny, by: 2) { for x in Swift.stride(from: 0, to: v.nx, by: 2)
-            where head[g.index(x, y, z)] != 0 {
-            let p = v.patient(SIMD3(Double(x), Double(y), Double(z)))
-            if p.z < zLo + 70 && abs(p.x - xMid) < 50 { faceDepth = max(faceDepth, yFront - p.y) }
-        } } }
-        if faceDepth < 25 {
-            log.append(String(format: "eyes: head reaches only %.0f mm in front of the brain at eye level — the face is missing (defaced or outside the field of view)", faceDepth))
-            return []
-        }
 
-        // Sphere sample offsets (voxel units), sub-sampled for speed.
-        func offsets(_ r0: Double, _ r1: Double, step: Int) -> [SIMD3<Int>] {
-            var out: [SIMD3<Int>] = []
-            let rx = Int(ceil(r1 / v.spacing.x)), ry = Int(ceil(r1 / v.spacing.y)), rz = Int(ceil(r1 / v.spacing.z))
-            for dz in Swift.stride(from: -rz, through: rz, by: step) { for dy in Swift.stride(from: -ry, through: ry, by: step) { for dx in Swift.stride(from: -rx, through: rx, by: step) {
-                let r = simd_length(SIMD3(Double(dx) * v.spacing.x, Double(dy) * v.spacing.y, Double(dz) * v.spacing.z))
-                if r >= r0 && r <= r1 { out.append(SIMD3(dx, dy, dz)) }
+        // Trilinear sample of the smoothed intensity at a patient point (nil outside the grid).
+        func sample(_ p: SIMD3<Double>) -> Double? {
+            let q = v.voxel(p)
+            let x0 = Int(floor(q.x)), y0 = Int(floor(q.y)), z0 = Int(floor(q.z))
+            guard x0 >= 0, y0 >= 0, z0 >= 0, x0 + 1 < v.nx, y0 + 1 < v.ny, z0 + 1 < v.nz else { return nil }
+            let fx = q.x - Double(x0), fy = q.y - Double(y0), fz = q.z - Double(z0)
+            var acc = 0.0
+            for dz in 0 ... 1 { for dy in 0 ... 1 { for dx in 0 ... 1 {
+                let w = (dx == 1 ? fx : 1 - fx) * (dy == 1 ? fy : 1 - fy) * (dz == 1 ? fz : 1 - fz)
+                acc += w * Double(s[g.index(x0 + dx, y0 + dy, z0 + dz)])
             } } }
-            return out
+            return acc
         }
-        let core = offsets(0, 8, step: 2), shell = offsets(13.5, 17, step: 2)
-        func mean(_ c: SIMD3<Int>, _ offs: [SIMD3<Int>]) -> Double? {
-            var acc = 0.0, k = 0
-            for o in offs {
-                let p = c &+ o
-                guard p.x >= 0, p.y >= 0, p.z >= 0, p.x < v.nx, p.y < v.ny, p.z < v.nz else { return nil }
-                acc += Double(s[g.index(p.x, p.y, p.z)]); k += 1
+        // Golden-spiral directions; "back" ones exclude a forward cone (through the cornea/eyelids).
+        let dirs: [SIMD3<Double>] = (0 ..< 64).map { i in
+            let k = (Double(i) + 0.5) / 64, phi = acos(1 - 2 * k), th = Double.pi * (1 + sqrt(5)) * Double(i)
+            return SIMD3(sin(phi) * cos(th), sin(phi) * sin(th), cos(phi))
+        }
+        let backDirs = dirs.filter { simd_dot($0, anterior) < 0.3 }
+        func mean(_ c: SIMD3<Double>, radius r: Double, _ ds: [SIMD3<Double>]) -> Double? {
+            var acc = 0.0
+            for d in ds { guard let x = sample(c + d * r) else { return nil }; acc += x }
+            return acc / Double(ds.count)
+        }
+        // Globe size scales with age (adult r ≈ 12 mm, young child ≈ 9–10.5 mm), so contrast is measured
+        // at several radii and the best one kept.
+        func contrast(_ c: SIMD3<Double>, radius r: Double) -> (core: Double, shell: Double)? {
+            guard let c0 = sample(c), let c1 = mean(c, radius: 0.35 * r, dirs), let c2 = mean(c, radius: 0.6 * r, dirs),
+                  let s1 = mean(c, radius: 1.2 * r, backDirs), let s2 = mean(c, radius: 1.4 * r, backDirs) else { return nil }
+            return ((c0 + c1 + c2) / 3, (s1 + s2) / 2)
+        }
+        let radii: [Double] = [8, 9.5, 11, 12.5]
+        /// Darkest sample inside the core (≤ 0.6 r): air pockets (sinuses, airway) reach near-background values.
+        func coreMin(_ c: SIMD3<Double>, radius r: Double) -> Double {
+            var m = sample(c) ?? 0
+            for rr in [0.35 * r, 0.6 * r] { for d in dirs { if let x = sample(c + d * rr) { m = min(m, x) } } }
+            return m
+        }
+        // Distance (mm) from each voxel to the nearest brain voxel: eyes sit outside the skull, clear of the brain.
+        let brainD2 = Filters.distanceSquared(brain, g, to: 1, outsideIsTarget: false)
+        func brainDistance(_ p: SIMD3<Double>) -> Double {
+            let q = v.voxel(p)
+            let xi = min(v.nx - 1, max(0, Int(q.x.rounded()))), yi = min(v.ny - 1, max(0, Int(q.y.rounded()))), zi = min(v.nz - 1, max(0, Int(q.z.rounded())))
+            return Double(brainD2[g.index(xi, yi, zi)]).squareRoot()
+        }
+        func bestContrast(_ c: SIMD3<Double>) -> (core: Double, shell: Double, radius: Double)? {
+            var best: (core: Double, shell: Double, radius: Double)?
+            for r in radii {
+                guard let k = contrast(c, radius: r) else { continue }
+                if best == nil || k.shell - k.core > best!.shell - best!.core { best = (k.core, k.shell, r) }
             }
-            return k > 0 ? acc / Double(k) : nil
+            return best
         }
 
-        struct Cand { let c: SIMD3<Int>; let p: SIMD3<Double>; let score: Double }
+        // Only used to express probe output in scan-independent units.
+        let airT = Double(ModelBuilder.airTissueThreshold(s))
+        if let probe = ProcessInfo.processInfo.environment["MRI_EYE_PROBE"] {
+            for item in probe.split(separator: ";") {
+                let f = item.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+                guard f.count == 3 else { continue }
+                let p = SIMD3(f[0], f[1], f[2])
+                for r in radii { if let k = contrast(p, radius: r) {
+                    log.append(String(format: "eye probe LPS (%.0f, %.0f, %.0f) r %.1f: core %.2f min %.2f shell %.2f (×air threshold), %.1f mm from brain",
+                                      p.x, p.y, p.z, r, k.core / airT, coreMin(p, radius: r) / airT, k.shell / airT, brainDistance(p)))
+                } }
+            }
+        }
+        struct Cand { let p: SIMD3<Double>; let score: Double; let radius: Double }
         var cands: [Cand] = []
-        let step = max(1, Int((2.0 / v.spacing.x).rounded()))
-        for z in Swift.stride(from: 0, to: v.nz, by: step) { for y in Swift.stride(from: 0, to: v.ny, by: step) { for x in Swift.stride(from: 0, to: v.nx, by: step) {
-            let i = g.index(x, y, z)
-            guard head[i] != 0, brain[i] == 0, s[i] < t else { continue }
-            let p = v.patient(SIMD3(Double(x), Double(y), Double(z)))
-            guard p.y > yFront - 40, p.y < yFront + 15, p.z > zLo, p.z < zHi - 40, abs(p.x - xMid) > 20, abs(p.x - xMid) < 45 else { continue }
-            let c = SIMD3(x, y, z)
-            guard let mc = mean(c, core), mc < Double(t) * 0.8, let ms = mean(c, shell) else { continue }
-            cands.append(Cand(c: c, p: p, score: (ms - mc) / Double(t)))
-        } } }
+        for z in Swift.stride(from: zLo, through: zLo + 80, by: 2) {
+            for y in Swift.stride(from: yFront - 40, through: yFront + 35, by: 2) {
+                for dx in Swift.stride(from: 16.0, through: 46, by: 2) {
+                    for side in [-1.0, 1.0] {
+                        let p = SIMD3(xMid + side * dx, y, z)
+                        let q = v.voxel(p)
+                        let xi = Int(q.x.rounded()), yi = Int(q.y.rounded()), zi = Int(q.z.rounded())
+                        guard xi >= 0, yi >= 0, zi >= 0, xi < v.nx, yi < v.ny, zi < v.nz, brain[g.index(xi, yi, zi)] == 0 else { continue }
+                        // Vitreous is uniform fluid: its darkest point stays close to its mean. Air pockets (sinuses,
+                        // airway) and CSF clefts mixed with bone dip far below it.
+                        guard let c = bestContrast(p), c.core < Double(t) * 0.6, brainDistance(p) >= c.radius + 3,
+                              coreMin(p, radius: c.radius) > 0.6 * c.core else { continue }
+                        cands.append(Cand(p: p, score: (c.shell - c.core) / Double(t), radius: c.radius))
+                    }
+                }
+            }
+        }
         cands.sort { $0.score > $1.score }
-        guard let first = cands.first else { log.append("eyes: no candidates found"); return [] }
         if verbose {
-            // Positions relative to the brain (x from midline, y behind the frontal pole, z above brain bottom).
             var shown: [SIMD3<Double>] = []
             for c in cands where shown.allSatisfy({ simd_length($0 - c.p) > 8 }) {
                 shown.append(c.p)
-                log.append(String(format: "eye candidate: x %+.0f y %+.0f z %+.0f mm  score %.2f", c.p.x - xMid, c.p.y - yFront, c.p.z - zLo, c.score))
-                if shown.count == 12 { break }
+                log.append(String(format: "eye candidate: LPS (%.0f, %.0f, %.0f)  r %.1f  contrast %.2f", c.p.x, c.p.y, c.p.z, c.radius, c.score))
+                if shown.count == 10 { break }
             }
         }
-        // Best partner on the other side, roughly mirror-symmetric.
-        let partner = cands.first { c in
-            let dx = abs(c.p.x - first.p.x)
-            return (c.p.x - xMid) * (first.p.x - xMid) < 0 && dx > 45 && dx < 80 && abs(c.p.y - first.p.y) < 12 && abs(c.p.z - first.p.z) < 12
+        guard !cands.isEmpty else { log.append("eyes: no candidates"); return [] }
+        // Mirror-symmetric pairs among the top candidates, strongest first. The single strongest spot is
+        // often something else (temporal CSF, a sinus), so each pair is verified by fitting spheres to the
+        // actual vitreous boundary; the first pair that fits as two plausible globes wins.
+        // Non-maximum suppression first, so one large dark region can't crowd out everything else.
+        var top: [Cand] = []
+        for c in cands where top.allSatisfy({ simd_length($0.p - c.p) >= 6 }) {
+            top.append(c)
+            if top.count == 80 { break }
         }
-        var out: [EyeballEstimate] = []
-        for cand in [first, partner].compactMap({ $0 }) {
-            guard let mc = mean(cand.c, core), let ms = mean(cand.c, shell) else { continue }
-            let cut = Float((mc + ms) / 2)
-            // Region-grow the dark globe within 15 mm of the candidate.
-            let r15 = 15.0
-            var seen = Set<Int>(), stack = [g.index(cand.c.x, cand.c.y, cand.c.z)]
-            var sum = SIMD3<Double>.zero, count = 0.0
-            seen.insert(stack[0])
-            while let i = stack.popLast() {
-                let x = i % g.nx, y = (i / g.nx) % g.ny, z = i / (g.nx * g.ny)
-                let p = v.patient(SIMD3(Double(x), Double(y), Double(z)))
-                sum += p; count += 1
-                for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
-                    let nx = x + dx, ny = y + dy, nz = z + dz
-                    guard nx >= 0, ny >= 0, nz >= 0, nx < g.nx, ny < g.ny, nz < g.nz else { continue }
-                    let j = g.index(nx, ny, nz)
-                    if seen.contains(j) || s[j] >= cut { continue }
-                    if simd_length(v.patient(SIMD3(Double(nx), Double(ny), Double(nz))) - cand.p) > r15 { continue }
-                    seen.insert(j); stack.append(j)
+        var pairs: [(a: Cand, b: Cand, score: Double)] = []
+        for i in top.indices { for j in top.indices where j > i {
+            let a = top[i], b = top[j]
+            guard (a.p.x - xMid) * (b.p.x - xMid) < 0 else { continue }
+            let dx = abs(a.p.x - b.p.x)
+            guard dx > 38, dx < 85, abs(a.p.y - b.p.y) < 10, abs(a.p.z - b.p.z) < 10,
+                  abs((a.p.x + b.p.x) / 2 - xMid) < 12 else { continue }
+            pairs.append((a, b, min(a.score, b.score) - 0.01 * (abs(a.p.y - b.p.y) + abs(a.p.z - b.p.z))))
+        } }
+        pairs.sort { $0.score > $1.score }
+        var tried: [SIMD3<Double>] = []
+        for pr in pairs {
+            let mid = (pr.a.p + pr.b.p) / 2
+            if tried.contains(where: { simd_length($0 - mid) < 8 }) { continue }
+            tried.append(mid)
+            if tried.count > 25 { break }
+            if verbose {
+                log.append(String(format: "eye pair: LPS (%.0f, %.0f, %.0f) + (%.0f, %.0f, %.0f)  contrast %.2f",
+                                  pr.a.p.x, pr.a.p.y, pr.a.p.z, pr.b.p.x, pr.b.p.y, pr.b.p.z, pr.score))
+            }
+            var out: [EyeballEstimate] = []
+            for cand in [pr.a, pr.b] {
+                guard let e = fitSphere(from: cand.p, startRadius: cand.radius, sample: sample, dirs: backDirs,
+                                        darkThreshold: t, contrast: { contrast($0, radius: $1) }) else { break }
+                out.append(e)
+            }
+            guard out.count == 2 else { if verbose { log.append("  sphere fit failed (\(fitFailure))") }; continue }
+            let sep = simd_length(out[0].center - out[1].center)
+            // Plausibility (children through adults): globes ≈ 16–28 mm across, centres ≈ 40–80 mm apart,
+            // similar sizes, clean spherical boundary, still clear of the brain.
+            let ok = (40 ... 80).contains(sep) && abs(out[0].radius - out[1].radius) < 2
+                && out.allSatisfy { $0.score > 0.3 && (8 ... 14).contains($0.radius) && $0.fitRMS < 1.5 && brainDistance($0.center) >= $0.radius }
+            if !ok {
+                if verbose { log.append(String(format: "  rejected: separation %.1f, radii %.1f/%.1f, rms %.2f/%.2f", sep, out[0].radius, out[1].radius, out[0].fitRMS, out[1].fitRMS)) }
+                continue
+            }
+            for e in out { log.append(e.description) }
+            log.append(String(format: "eyes: centre separation %.1f mm, height difference %.1f mm", sep, abs(out[0].center.z - out[1].center.z)))
+            return out
+        }
+        log.append("eyes: no candidate pair fits as two eyeballs")
+        return []
+    }
+
+    /// Casts rays backwards/sideways from `start`, finds where the dark vitreous ends, and fits a sphere
+    /// to those boundary points by linear least squares (three passes: re-centre, drop outliers).
+    static func fitSphere(from start: SIMD3<Double>, startRadius: Double, sample: (SIMD3<Double>) -> Double?, dirs: [SIMD3<Double>],
+                          darkThreshold t: Float, contrast: (SIMD3<Double>, Double) -> (core: Double, shell: Double)?) -> EyeballEstimate? {
+        var c = start
+        var r = startRadius, rms = 0.0, score = 0.0
+        for pass in 0 ..< 3 {
+            guard let k = contrast(c, min(13, max(8, r))) else { fitFailure = "pass \(pass): sample outside grid"; return nil }
+            score = (k.shell - k.core) / Double(t)
+            if k.core <= 0 { fitFailure = "pass \(pass): empty core"; return nil }
+            let cut = (k.core + k.shell) / 2
+            var pts: [SIMD3<Double>] = []
+            for d in dirs {
+                var prev: Double?
+                for step in 0 ..< 64 {
+                    let dist = 0.4 * r + Double(step) * 0.25
+                    guard let x = sample(c + d * dist) else { break }
+                    if x >= cut {
+                        let f = prev.map { (cut - $0) / max(1e-9, x - $0) } ?? 0
+                        pts.append(c + d * (dist - 0.25 * (1 - f)))
+                        break
+                    }
+                    prev = x
                 }
             }
-            let vol = count * g.voxelVolume
-            let r = pow(3 * vol / (4 * .pi), 1.0 / 3)
-            let e = EyeballEstimate(center: sum / max(1, count), radius: min(14, max(9, r)), score: cand.score)
-            log.append(e.description + String(format: " (region %.1f mL)", vol / 1000))
-            out.append(e)
+            if pass > 0 { pts = pts.filter { abs(simd_length($0 - c) - r) < 2.5 } }
+            guard pts.count >= 10, let fit = leastSquaresSphere(pts) else {
+                fitFailure = "pass \(pass): \(pts.count) boundary points"; return nil
+            }
+            c = fit.center; r = fit.radius
+            rms = sqrt(pts.reduce(0) { $0 + pow(simd_length($1 - c) - r, 2) } / Double(pts.count))
         }
-        guard out.count == 2 else { log.append("eyes: found \(out.count) (expected 2)"); return [] }
-        let sep = simd_length(out[0].center - out[1].center)
-        log.append(String(format: "eyes: centre separation %.1f mm, height difference %.1f mm", sep, abs(out[0].center.z - out[1].center.z)))
-        // Plausibility: adult globes ≈ 22–27 mm across, centres ≈ 55–75 mm apart, clear vitreous/fat contrast.
-        let ok = (50 ... 78).contains(sep) && out.allSatisfy { $0.score > 0.6 && (9.5 ... 14).contains($0.radius) }
-        if !ok { log.append("eyes: rejected as implausible (separation, size or contrast out of range)"); return [] }
-        return out
+        return EyeballEstimate(center: c, radius: r, score: score, fitRMS: rms)
+    }
+
+    /// Solves 2 p·c + (r² − |c|²) = |p|² for c and r.
+    static func leastSquaresSphere(_ pts: [SIMD3<Double>]) -> (center: SIMD3<Double>, radius: Double)? {
+        var ata = simd_double4x4(0), atb = SIMD4<Double>.zero
+        for p in pts {
+            let row = SIMD4(2 * p.x, 2 * p.y, 2 * p.z, 1)
+            let b = simd_length_squared(p)
+            for i in 0 ..< 4 { ata[i] += row * row[i] }
+            atb += row * b
+        }
+        guard abs(ata.determinant) > 1e-9 else { return nil }
+        let x = ata.inverse * atb
+        let c = SIMD3(x.x, x.y, x.z)
+        let r2 = x.w + simd_length_squared(c)
+        guard r2 > 0 else { return nil }
+        return (c, sqrt(r2))
     }
 }

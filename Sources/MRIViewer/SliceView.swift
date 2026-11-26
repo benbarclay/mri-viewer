@@ -70,6 +70,11 @@ final class SliceNSView: NSView {
         put(labels.bottom, CGPoint(x: rect.midX, y: rect.maxY - 10))
         TextCache.image("\(plane.label)  \(p.slice + 1)/\(r.sliceCount(plane))", style: .info)
             .draw(at: CGPoint(x: 8, y: 6), from: .zero, operation: .sourceOver, fraction: 1)
+        // Crosshair position in scanner coordinates (DICOM LPS mm), bottom-left — handy for reporting a location.
+        let c = store.cursor
+        let lps = r.volume.patient(SIMD3(Double(c[0]), Double(c[1]), Double(c[2])))
+        let pos = TextCache.image(String(format: "LPS %.0f, %.0f, %.0f mm   value %.0f", lps.x, lps.y, lps.z, r.volume.value(c[0], c[1], c[2])), style: .info)
+        pos.draw(at: CGPoint(x: 8, y: bounds.height - pos.size.height - 6), from: .zero, operation: .sourceOver, fraction: 1)
     }
 
     private func moveCursor(to event: NSEvent) {

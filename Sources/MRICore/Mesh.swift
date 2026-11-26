@@ -253,6 +253,28 @@ public enum MeshOps {
         for i in m.vertices.indices { m.vertices[i] *= s }
     }
 
+    /// Number of triangles a ray from `origin` along `dir` crosses (Möller–Trumbore).
+    public static func rayHits(_ m: Mesh, from origin: SIMD3<Float>, dir: SIMD3<Float>) -> Int {
+        var hits = 0
+        let d = simd_normalize(dir)
+        for t in Swift.stride(from: 0, to: m.triangles.count, by: 3) {
+            let a = m.vertices[Int(m.triangles[t])], b = m.vertices[Int(m.triangles[t + 1])], c = m.vertices[Int(m.triangles[t + 2])]
+            let e1 = b - a, e2 = c - a, h = simd_cross(d, e2), det = simd_dot(e1, h)
+            if abs(det) < 1e-9 { continue }
+            let f = 1 / det, s = origin - a, u = f * simd_dot(s, h)
+            if u < 0 || u > 1 { continue }
+            let q = simd_cross(s, e1), w = f * simd_dot(d, q)
+            if w < 0 || u + w > 1 { continue }
+            if f * simd_dot(e2, q) > 0 { hits += 1 }
+        }
+        return hits
+    }
+
+    /// Point-in-closed-mesh by ray parity (slightly skewed ray to avoid edge/vertex hits).
+    public static func contains(_ m: Mesh, _ p: SIMD3<Float>) -> Bool {
+        rayHits(m, from: p, dir: SIMD3<Float>(1, 0.000123, 0.000457)) % 2 == 1
+    }
+
     public static func bounds(_ m: Mesh) -> (min: SIMD3<Float>, max: SIMD3<Float>)? {
         guard var lo = m.vertices.first else { return nil }
         var hi = lo

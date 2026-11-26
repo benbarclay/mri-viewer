@@ -293,6 +293,18 @@ case "label-check":
         print(String(format: "labels brain: %.0f mL centroid LPS (%.1f, %.1f, %.1f) x %.0f..%.0f y %.0f..%.0f z %.0f..%.0f", sa.3, sa.0.x, sa.0.y, sa.0.z, sa.1.x, sa.2.x, sa.1.y, sa.2.y, sa.1.z, sa.2.z))
         print(String(format: "auto brain:   %.0f mL centroid LPS (%.1f, %.1f, %.1f) x %.0f..%.0f y %.0f..%.0f z %.0f..%.0f", sb.3, sb.0.x, sb.0.y, sb.0.z, sb.1.x, sb.2.x, sb.1.y, sb.2.y, sb.1.z, sb.2.z))
         print(String(format: "dice %.3f", dice))
+        // Anatomical direction sanity: lobe centroids in patient LPS (anterior = −y, left = +x, superior = +z).
+        let lab = lv.resampled(onto: v)
+        for (name, ids) in [("frontal", Anatomy.frontal), ("occipital", Anatomy.occipital), ("temporal", Anatomy.temporal)] {
+            for (side, base) in [("L", 1000), ("R", 2000)] {
+                var c = SIMD3<Double>.zero, n = 0.0
+                for z in Swift.stride(from: 0, to: v.nz, by: 2) { for y in Swift.stride(from: 0, to: v.ny, by: 2) { for x in Swift.stride(from: 0, to: v.nx, by: 2) {
+                    let l = Int(lab[v.index(x, y, z)])
+                    if l > base && l < base + 100 && ids.contains(l - base) { c += v.patient(SIMD3(Double(x), Double(y), Double(z))); n += 1 }
+                } } }
+                print(String(format: "%@ %@ centroid LPS (%.0f, %.0f, %.0f)", side, name, c.x / n, c.y / n, c.z / n))
+            }
+        }
         let la = lv.affine
         print(String(format: "label affine cols: (%.2f %.2f %.2f) (%.2f %.2f %.2f) (%.2f %.2f %.2f) origin (%.1f %.1f %.1f) dims %@",
                      la.columns.0.x, la.columns.0.y, la.columns.0.z, la.columns.1.x, la.columns.1.y, la.columns.1.z,
@@ -305,7 +317,7 @@ case "label-check":
 
 case "face-check":
     // For every series: how far forward (patient anterior) the head reaches per 10 mm height band.
-    // Shows whether the face/eyes are present (e.g. not defaced, inside the field of view). Numbers only.
+    // Shows whether the face is inside the field of view (or was removed by defacing). Numbers only.
     guard let dir = positional(0) else { fail(usage) }
     let all = scanSeries(dir)
     for (i, s) in all.enumerated() {
@@ -325,6 +337,61 @@ case "face-check":
         print("series \(i) [\(s.acquisitionPlane) \(s.description)] FOV y \(Int(min(c0.y, c1.y)))..\(Int(max(c0.y, c1.y))) z \(Int(min(c0.z, c1.z)))..\(Int(max(c0.z, c1.z)))")
         print("   anterior-most head y per height band (z:y): \(bands)")
     }
+
+case "extent-check":
+    // Tissue (above air/tissue threshold) voxel counts by distance in front of / behind the brain's
+    // anterior-most / posterior-most extent, plus the true FOV (all 8 corners). Numbers only.
+    guard let dir = positional(0), let labelsPath = positional(1) else { fail(usage) }
+    let (_, s) = pickSeries(scanSeries(dir))
+    do {
+        let v = try VolumeLoader.load(s)
+        let g = Grid(v)
+        let sm = Filters.gaussian(v.data, g, sigmaMM: 1)
+        let t = ModelBuilder.airTissueThreshold(sm)
+        let lab = try LabelVolume.read(URL(fileURLWithPath: labelsPath)).resampled(onto: v)
+        var lo = SIMD3<Double>(repeating: 1e9), hi = -lo
+        for cx in [0, v.nx - 1] { for cy in [0, v.ny - 1] { for cz in [0, v.nz - 1] {
+            let p = v.patient(SIMD3(Double(cx), Double(cy), Double(cz))); lo = simd_min(lo, p); hi = simd_max(hi, p)
+        } } }
+        print(String(format: "FOV LPS (8 corners): x %.0f..%.0f y %.0f..%.0f z %.0f..%.0f", lo.x, hi.x, lo.y, hi.y, lo.z, hi.z))
+        var yF = 1e9, yB = -1e9
+        for i in 0 ..< v.count where Anatomy.isBrain(lab[i]) {
+            let z = i / (v.nx * v.ny), y = (i / v.nx) % v.ny, x = i % v.nx
+            let p = v.patient(SIMD3(Double(x), Double(y), Double(z)))
+            yF = min(yF, p.y); yB = max(yB, p.y)
+        }
+        print(String(format: "brain y %.0f..%.0f; auto tissue threshold %.0f", yF, yB, t))
+        for tt in [Float(10), 15, 20, 30, 40, t] {
+            var front = [Int](repeating: 0, count: 6)
+            for z in 0 ..< v.nz { for y in 0 ..< v.ny { for x in 0 ..< v.nx where sm[v.index(x, y, z)] >= tt {
+                let p = v.patient(SIMD3(Double(x), Double(y), Double(z)))
+                if p.y < yF { front[min(5, Int((yF - p.y) / 10))] += 1 }
+            } } }
+            print(String(format: "threshold %3.0f: voxels in front of brain per 10 mm: ", tt) + "\(front)")
+        }
+    } catch { fail("\(error)") }
+
+case "kit-check":
+    // Fit checks on an exported kit folder: non-head parts must not intersect head material, and each
+    // eye's socket must open to the front (STL frame is RAS, anterior = +y).
+    guard let dir = positional(0) else { fail(usage) }
+    do {
+        let files = try FileManager.default.contentsOfDirectory(atPath: dir).filter { $0.hasSuffix(".stl") }.sorted()
+        let load = { (f: String) in try STL.read(URL(fileURLWithPath: dir).appendingPathComponent(f)) }
+        let head = try files.filter { $0.contains("head") }.map(load)
+        for f in files where !f.contains("head") {
+            let m = try load(f)
+            let sample = Swift.stride(from: 0, to: m.vertices.count, by: max(1, m.vertices.count / 300)).map { m.vertices[$0] }
+            let inside = sample.filter { p in head.contains { MeshOps.contains($0, p) } }.count
+            var line = "\(f): \(inside)/\(sample.count) sampled vertices inside head material"
+            if f.contains("eye"), let b = MeshOps.bounds(m) {
+                let c = (b.min + b.max) / 2
+                let hits = head.map { MeshOps.rayHits($0, from: c, dir: SIMD3(0.0003, 1, 0.0002)) }.reduce(0, +)
+                line += ", head surfaces in front of the eye: \(hits)"
+            }
+            print(line)
+        }
+    } catch { fail("\(error)") }
 
 case "check-stl":
     guard let path = positional(0) else { fail(usage) }

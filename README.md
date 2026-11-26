@@ -110,9 +110,12 @@ The parts:
 Neighbouring brain parts are separated by a 0.2 mm gap. The outer brain surface follows the scan
 intensity, and the cuts between parts follow the segmentation.
 
-- **Eyeballs need the face to be in the scan.** Many exports are *defaced* for anonymity. The tool
-  checks this (`mritool face-check <dir>` shows how far forward the head reaches) and skips the eyes,
-  rather than guessing, when the face is missing.
+- **Eyeballs** are found as dark, uniform, round vitreous cupped by brighter orbital tissue, clear of
+  the brain. Candidate pairs are then verified by fitting spheres to the vitreous boundary. Nothing
+  assumes adult anatomy: children's globes are smaller and closer together, and their face barely
+  protrudes in front of the brain. If no pair fits cleanly (for example, the scan was defaced), the
+  eyes are skipped rather than guessed. `mritool kit-check <kit-dir>` confirms that no part intersects
+  the head and that each eye socket opens to the front.
 - **Undercuts:** `kit.txt` reports any cavity volume that a straight vertical lift can't reach. The
   temporal lobes usually tuck under the bowl's rim, but since the brain comes out in pieces, each
   part can be angled in.

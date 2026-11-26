@@ -112,8 +112,11 @@ struct ViewerPane: View {
         let wl = String(format: "W %.0f  L %.0f", store.windowWidth, store.windowCenter)
         let c = store.cursor
         let value = v.value(c[0], c[1], c[2])
+        // Crosshair position in scanner coordinates (DICOM LPS: +x left, +y posterior, +z superior).
+        let p = v.patient(SIMD3(Double(c[0]), Double(c[1]), Double(c[2])))
         return "\(v.nx)×\(v.ny)×\(v.nz) · " + String(format: "%.2f×%.2f×%.2f mm", v.spacing.x, v.spacing.y, v.spacing.z)
-            + " · \(wl) · value \(Int(value))" + (store.status.isEmpty ? "" : " · \(store.status)")
+            + " · \(wl) · value \(Int(value))" + String(format: " · LPS %.0f, %.0f, %.0f mm", p.x, p.y, p.z)
+            + (store.status.isEmpty ? "" : " · \(store.status)")
     }
 }
 

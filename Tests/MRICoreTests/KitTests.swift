@@ -131,19 +131,21 @@ final class KitTests: XCTestCase {
         XCTAssertEqual(inside, 0, "\(inside) of \(sample.count) brain vertices are inside head material")
     }
 
-    func contains(_ m: Mesh, _ p: SIMD3<Float>) -> Bool {
-        var hits = 0
-        let dir = simd_normalize(SIMD3<Float>(1, 0.000123, 0.000457))
-        for t in stride(from: 0, to: m.triangles.count, by: 3) {
-            let a = m.vertices[Int(m.triangles[t])], b = m.vertices[Int(m.triangles[t + 1])], c = m.vertices[Int(m.triangles[t + 2])]
-            let e1 = b - a, e2 = c - a, h = simd_cross(dir, e2), det = simd_dot(e1, h)
-            if abs(det) < 1e-9 { continue }
-            let f = 1 / det, s = p - a, u = f * simd_dot(s, h)
-            if u < 0 || u > 1 { continue }
-            let q = simd_cross(s, e1), w = f * simd_dot(dir, q)
-            if w < 0 || u + w > 1 { continue }
-            if f * simd_dot(e2, q) > 0 { hits += 1 }
+    func contains(_ m: Mesh, _ p: SIMD3<Float>) -> Bool { MeshOps.contains(m, p) }
+
+    func testEyesSitInFrontOpeningSockets() throws {
+        let v = try phantom()
+        let r = PrintKit.build(v, labels: phantomLabels(v), options: KitOptions())
+        let eyes = r.parts.filter { $0.group == "eye" }
+        XCTAssertEqual(eyes.count, 2)
+        let head = r.parts.filter { $0.group == "head" }.map(\.mesh)
+        for e in eyes {
+            let verts = e.mesh.vertices
+            let sample = stride(from: 0, to: verts.count, by: max(1, verts.count / 200)).map { verts[$0] }
+            XCTAssertEqual(sample.filter { p in head.contains { contains($0, p) } }.count, 0, "\(e.name) intersects the head")
+            // STL frame is RAS: anterior = +y. Nothing in front of the eye centre (the socket opens forwards).
+            let b = MeshOps.bounds(e.mesh)!, c = (b.min + b.max) / 2
+            XCTAssertEqual(head.map { MeshOps.rayHits($0, from: c, dir: SIMD3(0.0003, 1, 0.0002)) }.reduce(0, +), 0, "\(e.name) socket is closed in front")
         }
-        return hits % 2 == 1
     }
 }
